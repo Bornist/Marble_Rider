@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Line Rider – Boost & Brake</title>
+  <style>
+    :root{ --bg:#0b0e14; --panel:#121722; --ink:#e8e8e8; --b:#1f2533; --blue:#60a5fa; --red:#ef4444; --yellow:#f59e0b; }
+    html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+    #canvas{position:fixed;inset:0;width:100vw;height:100dvh;display:block;touch-action:none;background:#000}
+    #ui{position:fixed;left:12px;top:12px;display:flex;flex-wrap:wrap;gap:8px;z-index:10}
+    .group{display:flex;gap:6px;background:#0f1420;border:1px solid var(--b);padding:6px;border-radius:12px;align-items:center}
+    .btn{background:var(--panel);border:1px solid var(--b);color:var(--ink);padding:8px 10px;border-radius:10px;cursor:pointer;font-size:14px;user-select:none}
+    .btn[aria-pressed="true"]{outline:2px solid #59c}
+    .swatch{width:12px;height:12px;border-radius:3px;display:inline-block;border:1px solid var(--b)}
+    #hud{position:fixed;right:12px;top:12px;background:var(--panel);padding:8px 10px;border-radius:10px;border:1px solid var(--b);font-size:12px;opacity:.9}
+    #overlay{position:fixed;left:50%;top:16px;transform:translateX(-50%);background:rgba(15,20,32,.8);padding:6px 10px;border-radius:10px;border:1px solid var(--b);font-size:12px}
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+
+  <div id="ui">
+    <div class="group" role="toolbar" aria-label="Modes">
+      <button class="btn" id="drawBtn" aria-pressed="true">Draw</button>
+      <button class="btn" id="playBtn">Play</button>
+      <button class="btn" id="startBtn">Set Start</button>
+      <button class="btn" id="resetBtn">Reset</button>
+    </div>
+    <div class="group" role="toolbar" aria-label="Tools">
+      <button class="btn" id="toolPen" aria-pressed="true">Pen <span class="swatch" style="background:var(--blue)"></span></button>
+      <button class="btn" id="toolArc">Arc</button>
+      <button class="btn" id="toolBoost">Boost <span class="swatch" style="background:var(--red)"></span></button>
+      <button class="btn" id="toolBrake">Brake <span class="swatch" style="background:var(--yellow)"></span></button>
+      <button class="btn" id="toolErase">Eraser</button>
+    </div>
+  </div>
+
+  <div id="overlay">Zeichnen (Pen/Arc) · Boost=rot · Brake=gelb · Voransicht halbtransparent · Play zum Start</div>
+  <div id="hud">FPS: <span id="fps">0</span></div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const DPR = Math.max(1, Math.floor(devicePixelRatio || 1));
+
+  const el = id => document.getElementById(id);
+  const drawBtn = el('drawBtn'), playBtn = el('playBtn'), startBtn = el('startBtn'), resetBtn = el('resetBtn');
+  const toolPen = el('toolPen'), toolArc = el('toolArc'), toolBoost = el('toolBoost'), toolBrake = el('toolBrake'), toolErase = el('toolErase');
+  const fpsOut = el('fps');
+
+  // View/World
+  const view = { x:0, y:0, scale:1 };
+
+  // Stroke model
+  // stroke = { type: 'normal'|'boost'|'brake', points: [{x,y},...], shape: 'poly'|'quad' }
+  let strokes = [];
+
+  // Tools & modes
+  let mode = 'draw'; // 'draw' | 'play' | 'setstart'
+  let tool = 'pen'; // 'pen' | 'arc' | 'boost' | 'brake' | 'eraser'
+
+  // Arc temp state
+  let arcStage = 0; // 0 idle, 1 picking end, 2 adjusting bulge
+  let arcStart = null, arcEnd = null, arcCtrl = null;
+
+  // In-progress freehand points
+  let drawing = false, tempPoints = null;
+
+  // Ball & physics (single mode: free-body with segment collisions)
+  const ball = { r: 10, pos:{x:200,y:200}, vel:{x:0,y:0}, trail:[] };
+  const phys = {
+    g: 30,                  // strong gravity → schnelle Beschleunigung
+    restitution: 0.4,       // leichter, federnder Ball
+    fric: 0.04,             // tangentiale Reibung auf Kontakt
+    uphillDamp: 1.2,        // extra Bremsen bergauf (multipl. auf vt)
+    slopeGain: 1.2,         // stärkerer Einfluss der Steigung (zus. vt += g*ty)
+    boostAccel: 2400,       // tangentiales Plus auf Boost-Linien
+    brakeRate: 2.2,         // pro Sekunde prozentuale Dämpfung auf Brake-Linien
+    maxSub: 8,
+    worldPad: 2000,
+  };
+
+  // ---------- Helpers ----------
+  function resize(){ const w = Math.floor(innerWidth*DPR), h = Math.floor((innerHeight||document.documentElement.clientHeight)*DPR); if (canvas.width!==w||canvas.height!==h){ canvas.width=w; canvas.height=h; } }
+  function worldPt(px,py){ const r=canvas.getBoundingClientRect(); const x=(px-r.left)*canvas.width/r.width, y=(py-r.top)*canvas.height/r.height; return { x:(x/DPR)/view.scale + view.x, y:(y/DPR)/view.scale + view.y }; }
+  function mix(a,b,t){ return {x:a.x+(b.x-a.x)*t, y:a.y+(b.y-a.y)*t}; }
+  function len(x,y){ return Math.hypot(x,y)||1; }
+  function nearestOnSeg(p,a,b){ const abx=b.x-a.x, aby=b.y-a.y; const ab2=abx*abx+aby*aby||1; const apx=p.x-a.x, apy=p.y-a.y; let t=(apx*abx+apy*aby)/ab2; t=Math.max(0,Math.min(1,t)); return {x:a.x+abx*t,y:a.y+aby*t,t}; }
+
+  function quadSample(p0,p1,p2, n=24){ const out=[]; for(let i=0;i<=n;i++){ const t=i/n; const u=1-t; out.push({ x:u*u*p0.x + 2*u*t*p1.x + t*t*p2.x, y:u*u*p0.y + 2*u*t*p1.y + t*t*p2.y }); } return out; }
+
+  function buildSegments(){
+    // Flatten to list of segments with type and back-reference stroke index
+    const segs=[];
+    for (let si=0; si<strokes.length; si++){
+      const s = strokes[si]; const P = s.points; if (!P || P.length<2) continue;
+      for (let i=0;i<P.length-1;i++) segs.push({ a:P[i], b:P[i+1], type:s.type, si });
+    }
+    // add soft boundaries around drawn area to avoid lost ball
+    return segs;
+  }
+
+  // ---------- Input ----------
+  const pointers = new Map();
+  canvas.addEventListener('pointerdown', (e)=>{
+    canvas.setPointerCapture(e.pointerId);
+    pointers.set(e.pointerId, {x:e.clientX, y:e.clientY});
+    const w = worldPt(e.clientX, e.clientY);
+
+    if (mode==='draw'){
+      if (tool==='pen' || tool==='boost' || tool==='brake'){
+        drawing = true; tempPoints = [w];
+      } else if (tool==='arc'){
+        if (arcStage===0){ arcStart = w; arcEnd = w; arcCtrl = w; arcStage=1; }
+      } else if (tool==='eraser'){
+        eraseAt(w);
+      }
+    } else if (mode==='setstart'){
+      ball.pos = {...w}; ball.vel={x:0,y:0}; mode='draw'; updateButtons();
+    }
+  });
+
+  canvas.addEventListener('pointermove', (e)=>{
+    const prev = pointers.get(e.pointerId); pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});
+    const w = worldPt(e.clientX, e.clientY);
+
+    if (mode==='draw'){
+      if (drawing && tempPoints){
+        const last=tempPoints[tempPoints.length-1]; const dx=w.x-last.x, dy=w.y-last.y; if (dx*dx+dy*dy>4) tempPoints.push(w);
+      } else if (tool==='arc'){
+        if (arcStage===1){ arcEnd = w; }
+        else if (arcStage===2){ arcCtrl = w; }
+      }
+      // Pan with 2 fingers or middle mouse
+      if (pointers.size>=2 || (e.buttons&4)){
+        if (prev){ const dx=e.clientX - prev.x, dy=e.clientY - prev.y; view.x -= dx/(view.scale); view.y -= dy/(view.scale); }
+      }
+    } else {
+      if (pointers.size>=2 || (e.buttons&4)){
+        if (prev){ const dx=e.clientX - prev.x, dy=e.clientY - prev.y; view.x -= dx/(view.scale); view.y -= dy/(view.scale); }
+      }
+    }
+  });
+
+  canvas.addEventListener('pointerup', (e)=>{
+    pointers.delete(e.pointerId);
+    const w = worldPt(e.clientX, e.clientY);
+
+    if (mode==='draw'){
+      if ((tool==='pen' || tool==='boost' || tool==='brake') && drawing && tempPoints){
+        if (tempPoints.length>1){
+          strokes.push({ type: tool==='boost'?'boost': tool==='brake'?'brake':'normal', points: tempPoints.slice(), shape:'poly' });
+        }
+        drawing=false; tempPoints=null;
+      } else if (tool==='arc'){
+        if (arcStage===1){ arcEnd = w; arcStage=2; arcCtrl = mix(arcStart, arcEnd, 0.5); }
+        else if (arcStage===2){ arcCtrl = w; const pts = quadSample(arcStart, arcCtrl, arcEnd, 24); strokes.push({ type:'normal', points:pts, shape:'quad' }); arcStage=0; }
+      }
+    }
+  });
+
+  canvas.addEventListener('pointercancel', (e)=>{ pointers.delete(e.pointerId); drawing=false; tempPoints=null; arcStage=0; });
+  canvas.addEventListener('wheel', (e)=>{
+    e.preventDefault();
+    const factor=Math.pow(1.0015,-e.deltaY);
+    const mx=e.clientX,my=e.clientY; const before=worldPt(mx,my);
+    view.scale=Math.max(0.2,Math.min(4,view.scale*factor));
+    const after=worldPt(mx,my); view.x += (before.x - after.x); view.y += (before.y - after.y);
+  }, {passive:false});
+
+  function eraseAt(w){
+    // Delete nearest stroke if within threshold
+    const threshold = 12; let best={si:-1, d2:Infinity};
+    for (let si=0; si<strokes.length; si++){
+      const P = strokes[si].points; for (let i=0;i<P.length-1;i++){
+        const q=nearestOnSeg(w,P[i],P[i+1]); const dx=w.x-q.x, dy=w.y-q.y; const d2=dx*dx+dy*dy; if (d2<best.d2){ best={si,d2}; }
+      }
+    }
+    if (best.si>=0 && best.d2 < threshold*threshold){ strokes.splice(best.si,1); }
+  }
+
+  // ---------- Buttons ----------
+  function updateButtons(){
+    drawBtn.setAttribute('aria-pressed', String(mode==='draw'));
+    playBtn.setAttribute('aria-pressed', String(mode==='play'));
+    startBtn.setAttribute('aria-pressed', String(mode==='setstart'));
+
+    toolPen.setAttribute('aria-pressed', String(tool==='pen'));
+    toolArc.setAttribute('aria-pressed', String(tool==='arc'));
+    toolBoost.setAttribute('aria-pressed', String(tool==='boost'));
+    toolBrake.setAttribute('aria-pressed', String(tool==='brake'));
+    toolErase.setAttribute('aria-pressed', String(tool==='eraser'));
+  }
+
+  drawBtn.onclick=()=>{ mode='draw'; updateButtons(); };
+  playBtn.onclick=()=>{ mode='play'; updateButtons(); };
+  startBtn.onclick=()=>{ mode='setstart'; updateButtons(); };
+  resetBtn.onclick=()=>{ ball.vel={x:0,y:0}; ball.trail=[]; };
+
+  toolPen.onclick=()=>{ tool='pen'; updateButtons(); };
+  toolArc.onclick=()=>{ tool='arc'; arcStage=0; updateButtons(); };
+  toolBoost.onclick=()=>{ tool='boost'; updateButtons(); };
+  toolBrake.onclick=()=>{ tool='brake'; updateButtons(); };
+  toolErase.onclick=()=>{ tool='eraser'; updateButtons(); };
+
+  // ---------- Physics ----------
+  function step(dt){ if (mode!=='play') return; integrate(dt); }
+
+  function integrate(dt){
+    // gravity
+    ball.vel.y += phys.g * dt;
+
+    // substeps for collision stability
+    const sub = Math.min(phys.maxSub, Math.max(1, Math.ceil((Math.abs(ball.vel.x)+Math.abs(ball.vel.y))*dt/500)));
+    const h = dt/sub;
+    const segs = buildSegments();
+
+    for (let k=0;k<sub;k++){
+      // integrate position
+      ball.pos.x += ball.vel.x*h;
+      ball.pos.y += ball.vel.y*h;
+
+      // collide with segments
+      for (let i=0;i<segs.length;i++){
+        const {a,b,type} = segs[i];
+        const q = nearestOnSeg(ball.pos, a, b);
+        const dx = ball.pos.x - q.x, dy = ball.pos.y - q.y; const d2 = dx*dx + dy*dy; const r = ball.r;
+        if (d2 < r*r){
+          const d = Math.sqrt(d2)||1; const nx = dx/d, ny = dy/d; // surface normal from seg->ball
+          // push out of surface
+          const pen = r - d; ball.pos.x += nx*pen; ball.pos.y += ny*pen;
+          // tangent
+          const tx = b.x-a.x, ty=b.y-a.y; const tl = Math.hypot(tx,ty)||1; const tnx = tx/tl, tny=ty/tl;
+          // decompose velocity
+          let vn = ball.vel.x*nx + ball.vel.y*ny; // into surface > 0 means moving away? we used normal from seg to ball.
+          let vt = ball.vel.x*tnx + ball.vel.y*tny;
+          // bounce on normal (vn becomes positive away from surface)
+          if (vn < 0) vn = -vn * phys.restitution; // reflect
+          else vn *= 0.98; // tiny damping if separating
+          // friction on tangent
+          vt *= Math.max(0, 1 - phys.fric*h*6);
+          // stronger slope effect (add g component along tangent)
+          vt += phys.g * (tny) * phys.slopeGain * h;
+          // uphill extra damping
+          if (tny < 0) vt *= Math.max(0, 1 - phys.uphillDamp * (-tny) * h);
+          // surface specials
+          if (type==='boost') vt += phys.boostAccel * h;
+          if (type==='brake') vt *= Math.max(0, 1 - phys.brakeRate * h);
+          // recompose
+          ball.vel.x = vn*nx + vt*tnx;
+          ball.vel.y = vn*ny + vt*tny;
+        }
+      }
+
+      // soft world bounds (big box around 0,0 .. worldPad)
+      const pad = phys.worldPad; const minx=-pad, miny=-pad, maxx=pad+innerWidth, maxy=pad+innerHeight;
+      if (ball.pos.x < minx+ball.r){ ball.pos.x=minx+ball.r; ball.vel.x = Math.abs(ball.vel.x)*phys.restitution; }
+      if (ball.pos.x > maxx-ball.r){ ball.pos.x=maxx-ball.r; ball.vel.x = -Math.abs(ball.vel.x)*phys.restitution; }
+      if (ball.pos.y < miny+ball.r){ ball.pos.y=miny+ball.r; ball.vel.y = Math.abs(ball.vel.y)*phys.restitution; }
+      if (ball.pos.y > maxy-ball.r){ ball.pos.y=maxy-ball.r; ball.vel.y = -Math.abs(ball.vel.y)*phys.restitution; }
+    }
+  }
+
+  // ---------- Render ----------
+  function render(){
+    resize();
+    ctx.save(); ctx.clearRect(0,0,canvas.width,canvas.height);
+    ctx.scale(DPR, DPR);
+    ctx.save(); ctx.scale(view.scale, view.scale); ctx.translate(-view.x, -view.y);
+
+    // draw strokes
+    ctx.lineJoin='round'; ctx.lineCap='round';
+    for (const s of strokes){
+      if (!s.points || s.points.length<2) continue;
+      ctx.beginPath(); ctx.moveTo(s.points[0].x, s.points[0].y);
+      for (let i=1;i<s.points.length;i++) ctx.lineTo(s.points[i].x, s.points[i].y);
+      ctx.lineWidth = 6; ctx.strokeStyle = (s.type==='boost'? '#ef4444' : s.type==='brake'? '#f59e0b' : '#60a5fa');
+      ctx.stroke();
+    }
+
+    // preview drawing (transparent)
+    ctx.globalAlpha = 0.45;
+    if (drawing && tempPoints && tempPoints.length>1){
+      ctx.beginPath(); ctx.moveTo(tempPoints[0].x, tempPoints[0].y);
+      for (let i=1;i<tempPoints.length;i++) ctx.lineTo(tempPoints[i].x, tempPoints[i].y);
+      ctx.lineWidth=6; ctx.strokeStyle = (tool==='boost'? '#ef4444' : tool==='brake'? '#f59e0b' : '#60a5fa');
+      ctx.stroke();
+    }
+    if (tool==='arc' && arcStage>0){
+      if (arcStage===1){
+        ctx.beginPath(); ctx.moveTo(arcStart.x, arcStart.y); ctx.lineTo(arcEnd.x, arcEnd.y);
+        ctx.lineWidth=6; ctx.strokeStyle = '#60a5fa'; ctx.stroke();
+      } else if (arcStage===2){
+        const pts = quadSample(arcStart, arcCtrl, arcEnd, 24);
+        ctx.beginPath(); ctx.moveTo(pts[0].x, pts[0].y);
+        for (let i=1;i<pts.length;i++) ctx.lineTo(pts[i].x, pts[i].y);
+        ctx.lineWidth=6; ctx.strokeStyle = '#60a5fa'; ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // ball trail (subtle)
+    ctx.fillStyle = 'rgba(253, 224, 71, 0.4)';
+    for (let i=Math.max(0,ball.trail.length-120); i<ball.trail.length; i++){
+      const p = ball.trail[i]; ctx.beginPath(); ctx.arc(p.x, p.y, 2, 0, Math.PI*2); ctx.fill();
+    }
+
+    // ball
+    ctx.fillStyle='#fde047'; ctx.beginPath(); ctx.arc(ball.pos.x, ball.pos.y, ball.r, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle='#a16207'; ctx.lineWidth=2; ctx.stroke();
+
+    ctx.restore(); ctx.restore();
+  }
+
+  // ---------- Loop ----------
+  let last = performance.now();
+  const fpsCounter = { acc:0, n:0, fps:0, update(dt){ this.acc+=dt; this.n++; if (this.acc>=0.5){ this.fps=this.n/this.acc; this.acc=0; this.n=0; } } };
+
+  function loop(ts){ const dt = Math.min(0.033, (ts-last)/1000); last = ts; if (mode==='play'){ ball.trail.push({x:ball.pos.x,y:ball.pos.y}); if (ball.trail.length>500) ball.trail.shift(); } else { ball.trail.length=0; }
+    step(dt); render(); fpsCounter.update(dt); fpsOut.textContent = fpsCounter.fps.toFixed(0); requestAnimationFrame(loop); }
+
+  // ---------- Init ----------
+  function init(){ resize(); updateButtons(); }
+  function updateButtons(){
+    drawBtn.setAttribute('aria-pressed', String(mode==='draw'));
+    playBtn.setAttribute('aria-pressed', String(mode==='play'));
+    startBtn.setAttribute('aria-pressed', String(mode==='setstart'));
+    toolPen.setAttribute('aria-pressed', String(tool==='pen'));
+    toolArc.setAttribute('aria-pressed', String(tool==='arc'));
+    toolBoost.setAttribute('aria-pressed', String(tool==='boost'));
+    toolBrake.setAttribute('aria-pressed', String(tool==='brake'));
+    toolErase.setAttribute('aria-pressed', String(tool==='eraser'));
+  }
+
+  init();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
