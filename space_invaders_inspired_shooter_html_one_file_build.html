@@ -1,0 +1,451 @@
+<!--
+Space Invaders-Inspired Shooter — Single-File HTML Build
+Author: ChatGPT (GPT-5 Thinking)
+Date: 2025-08-14
+
+==================== OVERVIEW ====================
+Core idea
+- Vertical, auto-scrolling "universe" (starfield) to simulate the ship flying upward.
+- Player ship: moves LEFT/RIGHT with arrow keys; shoot with SPACE.
+- Enemies: Invaders-style rows that sway horizontally and periodically step downward.
+- Pixel look: Everything is drawn as pixel-art sprites using a tiny matrix and upscale (nearest-neighbor) for a 32-bit retro vibe.
+- Game systems: score, lives, wave progression, basic hitboxes, cooldown for firing, pause/restart.
+
+Controls
+- Arrow Left/Right = move ship (clamped to screen)
+- Space = fire
+- P = pause/resume
+- R = restart (from game over or anytime)
+
+Tech details
+- Pure HTML + Canvas + JS, no external assets or libraries.
+- Pixel aesthetic via: CSS image-rendering: pixelated; integer upscaling per-sprite.
+- Responsive letterbox: canvas scales to fit window while preserving crisp pixels.
+- Easy to tweak: change GAME settings in CONFIG near the top of the script.
+
+How to run
+- Save this file as `space_invaders_like.html` and open it in any modern desktop browser.
+
+==================================================
+-->
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Space Invaders – Pixel Shooter</title>
+  <style>
+    :root {
+      color-scheme: dark;
+    }
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #0b0f1a;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, sans-serif;
+      overflow: hidden; /* prevent scrollbars while letterboxing */
+    }
+    .wrap {
+      position: fixed;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      background: radial-gradient(1200px 800px at 50% 40%, rgba(20,30,50,.6), rgba(5,8,15,1) 70%);
+    }
+    canvas {
+      /* crisp pixels */
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+      box-shadow: 0 0 0 2px rgba(255,255,255,.05), 0 20px 80px rgba(0,0,0,.6);
+      background: #000; /* starfield drawn in JS */
+      border-radius: 10px;
+    }
+    .hud {
+      position: fixed;
+      left: 50%;
+      transform: translateX(-50%);
+      bottom: 14px;
+      color: #bcd1ff;
+      font-size: 14px;
+      opacity: .9;
+      text-shadow: 0 1px 0 #000;
+      user-select: none;
+      pointer-events: none;
+      white-space: pre;
+    }
+    .toast {
+      position: fixed;
+      top: 14px;
+      left: 50%;
+      transform: translateX(-50%);
+      color: #e7ecff;
+      font-weight: 600;
+      font-size: 14px;
+      opacity: .85;
+      text-shadow: 0 2px 12px rgba(0,0,0,.7);
+      user-select: none;
+      pointer-events: none;
+    }
+    .centerMsg {
+      position: fixed;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      color: #e7ecff;
+      font-weight: 700;
+      font-size: 18px;
+      text-align: center;
+      text-shadow: 0 1px 0 #000, 0 2px 18px rgba(0,0,0,.8);
+      pointer-events: none;
+    }
+    .kbd { padding: 2px 6px; border-radius: 6px; background: #121826; border: 1px solid #2a3551; font-weight: 700; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <canvas id="game" width="240" height="360" aria-label="Space Invaders Pixel Shooter"></canvas>
+  </div>
+  <div class="toast" id="toast">← → bewegen · <span class="kbd">Space</span> feuern · <span class="kbd">P</span> Pause · <span class="kbd">R</span> Neustart</div>
+  <div class="hud" id="hud"></div>
+  <div class="centerMsg" id="centerMsg" style="display:none"></div>
+
+<script>
+// =================== CONFIG ===================
+const CONFIG = {
+  worldW: 240, // logical canvas size (fits the pixel look nicely)
+  worldH: 360,
+  ship: {
+    speed: 1.2,       // left/right speed
+    fireCooldown: 220,// ms between shots
+    bulletSpeed: 3.0,
+    lives: 3
+  },
+  starfield: {
+    count: 160,
+    speedMin: 0.2,
+    speedMax: 1.0
+  },
+  invaders: {
+    cols: 8,
+    rows: 4,
+    xSpacing: 20,
+    ySpacing: 16,
+    startY: 40,
+    swayAmplitude: 10,
+    swayPeriodMs: 2200,
+    stepDownEveryMs: 3000,
+    bulletSpeed: 1.2,
+    fireChancePerSec: 0.75 // avg shots per second across the formation
+  },
+  bullets: {
+    maxOnScreen: 4
+  },
+  difficulty: {
+    waveSpeedUp: 1.06, // multiplier each wave
+    fireRateUp: 1.08
+  }
+};
+
+// Scale canvas to fit window while keeping pixel crispness
+(function setupCanvasScale(){
+  const cvs = document.getElementById('game');
+  function fit(){
+    const {innerWidth:w, innerHeight:h} = window;
+    const scale = Math.floor(Math.min(w/CONFIG.worldW, h/CONFIG.worldH));
+    const s = Math.max(1, scale);
+    cvs.style.width = (CONFIG.worldW * s) + 'px';
+    cvs.style.height = (CONFIG.worldH * s) + 'px';
+  }
+  addEventListener('resize', fit);
+  fit();
+})();
+
+// =================== UTIL ===================
+const rand = (a,b)=>a+Math.random()*(b-a);
+const clamp=(v,min,max)=>Math.max(min,Math.min(max,v));
+const nowMs=()=>performance.now();
+
+// Pixel sprite drawing from matrix (1 = filled)
+function drawSprite(ctx, matrix, x, y, scale=2, color='#9fd4ff'){
+  ctx.save();
+  ctx.translate(Math.round(x), Math.round(y));
+  ctx.fillStyle=color;
+  for(let r=0;r<matrix.length;r++){
+    for(let c=0;c<matrix[r].length;c++){
+      if(matrix[r][c]){
+        ctx.fillRect(c*scale, r*scale, scale, scale);
+      }
+    }
+  }
+  ctx.restore();
+}
+
+// Simple starfield
+function makeStarfield(){
+  const stars=[];
+  for(let i=0;i<CONFIG.starfield.count;i++){
+    stars.push({
+      x: Math.random()*CONFIG.worldW,
+      y: Math.random()*CONFIG.worldH,
+      s: rand(CONFIG.starfield.speedMin, CONFIG.starfield.speedMax)
+    });
+  }
+  return stars;
+}
+
+// Ship + sprites
+const SHIP_SPRITE = [
+  [0,0,1,0,0],
+  [0,1,1,1,0],
+  [1,1,1,1,1],
+  [0,1,1,1,0],
+  [0,0,1,0,0],
+  [0,1,1,1,0],
+];
+
+const INVADER_SPRITE_A = [
+  [0,1,0,1,0],
+  [1,1,1,1,1],
+  [1,0,1,0,1],
+  [1,1,1,1,1],
+  [0,1,0,1,0],
+];
+
+const INVADER_SPRITE_B = [
+  [0,1,1,1,0],
+  [1,0,1,0,1],
+  [1,1,1,1,1],
+  [0,1,1,1,0],
+  [0,0,1,0,0],
+];
+
+const BULLET_SPRITE = [
+  [1],
+  [1],
+  [1],
+];
+
+// =================== GAME STATE ===================
+const cvs = document.getElementById('game');
+const ctx = cvs.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+
+let stars = makeStarfield();
+let keys = new Set();
+let lastShotAt = 0;
+let player, bullets, enemyBullets, invaders, formation, score, lives, wave, paused, gameOver;
+let lastStepDownAt = 0;
+let lastTime = nowMs();
+
+function resetGame(){
+  score = 0; lives = CONFIG.ship.lives; wave=1; paused=false; gameOver=false;
+  player = { x: CONFIG.worldW/2, y: CONFIG.worldH-40, w: 10, h: 12, speed: CONFIG.ship.speed };
+  bullets = [];
+  enemyBullets = [];
+  spawnWave(1);
+}
+
+function spawnWave(w){
+  invaders=[];
+  formation = { baseX: CONFIG.worldW/2, dir: 1, swayT0: nowMs(), swayA: CONFIG.invaders.swayAmplitude*Math.pow(CONFIG.difficulty.waveSpeedUp, w-1) };
+  const cols = CONFIG.invaders.cols;
+  const rows = CONFIG.invaders.rows;
+  const xS = CONFIG.invaders.xSpacing;
+  const yS = CONFIG.invaders.ySpacing;
+  const startY = CONFIG.invaders.startY;
+  for(let r=0;r<rows;r++){
+    for(let c=0;c<cols;c++){
+      invaders.push({
+        col:c, row:r,
+        alive:true,
+        x: 0, y: 0, // computed each frame from formation
+        frame: ((r+c)%2),
+      });
+    }
+  }
+  formation.cols=cols; formation.rows=rows; formation.startY=startY; formation.xSpacing=xS; formation.ySpacing=yS;
+  lastStepDownAt = nowMs();
+}
+
+// =================== INPUT ===================
+addEventListener('keydown', (e)=>{
+  if(['ArrowLeft','ArrowRight',' ' ,'Space','KeyP','KeyR','p','r'].includes(e.code)) e.preventDefault();
+  if(e.code==='ArrowLeft') keys.add('left');
+  if(e.code==='ArrowRight') keys.add('right');
+  if(e.code==='Space') keys.add('space');
+  if(e.code==='KeyP') paused = !paused;
+  if(e.code==='KeyR') resetGame();
+});
+addEventListener('keyup', (e)=>{
+  if(e.code==='ArrowLeft') keys.delete('left');
+  if(e.code==='ArrowRight') keys.delete('right');
+  if(e.code==='Space') keys.delete('space');
+});
+
+// =================== GAME LOOP ===================
+function loop(t){
+  const dt = Math.min(32, t - lastTime); // clamp dt for stability
+  lastTime = t;
+  if(!paused && !gameOver){
+    update(dt);
+  }
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+function update(dt){
+  // auto upward flight: move starfield downward
+  for(const s of stars){
+    s.y += s.s * (dt/16);
+    if(s.y>CONFIG.worldH){ s.y = -2; s.x = Math.random()*CONFIG.worldW; s.s = rand(CONFIG.starfield.speedMin, CONFIG.starfield.speedMax); }
+  }
+
+  // player movement
+  let vx = 0;
+  if(keys.has('left')) vx -= player.speed;
+  if(keys.has('right')) vx += player.speed;
+  player.x = clamp(player.x + vx*(dt/16)*2.0, 10, CONFIG.worldW-10);
+
+  // shooting
+  const wantShoot = keys.has('space');
+  const cd = CONFIG.ship.fireCooldown/Math.pow(CONFIG.difficulty.fireRateUp, wave-1);
+  if(wantShoot && (nowMs()-lastShotAt)>cd && bullets.length < CONFIG.bullets.maxOnScreen){
+    bullets.push({x: player.x-1, y: player.y-6, vy: -CONFIG.ship.bulletSpeed});
+    lastShotAt = nowMs();
+  }
+
+  // update bullets
+  bullets.forEach(b=>b.y += b.vy*(dt/16));
+  bullets = bullets.filter(b=>b.y>-10);
+
+  // formation movement: sway horizontally around baseX
+  const time = nowMs();
+  const swayPhase = ((time - formation.swayT0) % CONFIG.invaders.swayPeriodMs) / CONFIG.invaders.swayPeriodMs;
+  const sway = Math.sin(swayPhase*2*Math.PI) * formation.swayA;
+
+  // step down occasionally
+  if(time - lastStepDownAt > CONFIG.invaders.stepDownEveryMs){
+    formation.startY += 6; // drop down a bit
+    lastStepDownAt = time;
+  }
+
+  // position invaders and maybe fire
+  const aliveInvaders = invaders.filter(i=>i.alive);
+  const cols = formation.cols; const rows = formation.rows;
+  for(const inv of invaders){
+    if(!inv.alive) continue;
+    inv.x = Math.round(formation.baseX + sway + (inv.col-(cols-1)/2)*formation.xSpacing);
+    inv.y = Math.round(formation.startY + inv.row*formation.ySpacing);
+  }
+
+  // enemy shooting (random among bottom-most of each column)
+  const bottomsByCol = {};
+  for(const inv of invaders){
+    if(!inv.alive) continue;
+    const key = inv.col;
+    if(!bottomsByCol[key] || inv.row>bottomsByCol[key].row) bottomsByCol[key] = inv;
+  }
+  const fireProb = (CONFIG.invaders.fireChancePerSec*Math.pow(CONFIG.difficulty.fireRateUp,wave-1)) * (dt/1000);
+  for(const colKey in bottomsByCol){
+    if(Math.random()<fireProb){
+      const shooter = bottomsByCol[colKey];
+      enemyBullets.push({x: shooter.x, y: shooter.y+6, vy: CONFIG.invaders.bulletSpeed});
+    }
+  }
+  enemyBullets.forEach(b=>b.y += b.vy*(dt/16));
+  enemyBullets = enemyBullets.filter(b=>b.y<CONFIG.worldH+10);
+
+  // collisions: player bullets vs invaders
+  for(const b of bullets){
+    for(const inv of invaders){
+      if(!inv.alive) continue;
+      if(Math.abs(b.x - inv.x) < 6 && Math.abs(b.y - inv.y) < 6){
+        inv.alive=false; b.y=-9999; score += 10; break;
+      }
+    }
+  }
+
+  // collisions: enemy bullets vs player
+  for(const eb of enemyBullets){
+    if(Math.abs(eb.x - player.x) < 6 && Math.abs(eb.y - player.y) < 8){
+      eb.y = CONFIG.worldH+999;
+      lives -= 1;
+      flashCenterMsg('Treffer! -1 Leben', 600);
+      if(lives<=0){ gameOver = true; showGameOver(); }
+      break;
+    }
+  }
+
+  // wave clear
+  if(aliveInvaders.length===0){
+    wave += 1;
+    flashCenterMsg('Welle '+(wave-1)+' geschafft! Nächste kommt...', 900);
+    spawnWave(wave);
+    // make it a bit harder each wave
+    CONFIG.invaders.swayAmplitude *= CONFIG.difficulty.waveSpeedUp;
+  }
+
+  // invaders reach player line -> game over
+  for(const inv of invaders){
+    if(inv.alive && inv.y > player.y-8){
+      gameOver = true; showGameOver();
+      break;
+    }
+  }
+}
+
+function render(){
+  // clear
+  ctx.clearRect(0,0,CONFIG.worldW,CONFIG.worldH);
+
+  // background stars
+  ctx.fillStyle='#000';
+  ctx.fillRect(0,0,CONFIG.worldW,CONFIG.worldH);
+  ctx.fillStyle='#6aa3e5';
+  for(const s of stars){
+    ctx.fillRect(s.x|0, s.y|0, 1, 1);
+  }
+
+  // draw player
+  drawSprite(ctx, SHIP_SPRITE, player.x-5, player.y-6, 2, '#9fd4ff');
+
+  // draw invaders
+  const t = nowMs();
+  for(const inv of invaders){
+    if(!inv.alive) continue;
+    const sprite = (Math.floor(t/300)%2) ? INVADER_SPRITE_A : INVADER_SPRITE_B;
+    drawSprite(ctx, sprite, inv.x-5, inv.y-5, 2, '#ffb3c7');
+  }
+
+  // bullets
+  for(const b of bullets){
+    drawSprite(ctx, BULLET_SPRITE, b.x, b.y, 2, '#e3ff7a');
+  }
+  for(const eb of enemyBullets){
+    drawSprite(ctx, BULLET_SPRITE, eb.x, eb.y, 2, '#ff7760');
+  }
+
+  // HUD
+  const hud = document.getElementById('hud');
+  hud.textContent = `Score: ${score}    Leben: ${lives}    Welle: ${wave}    ${(paused?'[PAUSE]':'')}`;
+}
+
+function showGameOver(){
+  flashCenterMsg('GAME OVER\n[R] Neustart', 1200);
+}
+
+let centerMsgTimer = null;
+function flashCenterMsg(text, ms){
+  const el = document.getElementById('centerMsg');
+  el.style.display='grid';
+  el.textContent = text;
+  clearTimeout(centerMsgTimer);
+  centerMsgTimer = setTimeout(()=>{ el.style.display='none'; }, ms);
+}
+
+// Boot
+resetGame();
+</script>
+</body>
+</html>
